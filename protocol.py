@@ -1,5 +1,6 @@
-import matplotlib.pyplot as plt
 from btree.btree_memory import Node, BTree
+from mmh3 import hash
+import matplotlib.pyplot as plt
 from enum import IntEnum
 import random
 import struct
@@ -10,7 +11,7 @@ import sys
 protocol_requirements = """
 The protocol for communication with the server follows a specific byte layout. Here is a brief description of the byte layout:
 
-1. **Operation Code (1 byte):** Indicates the type of operation to be performed (0 for PUT, 1 for GET, or 2 CONTAINS).
+1. **Operation Code (1 byte):** Indicates the type of operation to be performed (0 for PUT, 1 for GET, 2 CONTAINS, or 3 for SHUTDOWN).
 2. **Key Data Type (1 Byte):** Specifies the data type of the key, 0 for float, 1 for int, and 2 for string
 3. **Key Length (1 byte):** Specifies the length of the key in bytes.
 4. **Key (variable length):** The actual key data.
@@ -23,7 +24,7 @@ Please note that the byte layout described above is a high-level overview. The a
 
 return_protocol_requirements = """
 Return Byte Layout:
-1. **Operation Code (1 byte):** Indicates the type of operation that was performed (0 for PUT, 1 for GET, or 2 CONTAINS).
+1. **Operation Code (1 byte):** Indicates the type of operation that was performed (0 for PUT, 1 for GET, 2 CONTAINS, or 3 for SHUTDOWN).
 2. **Value Data Type (1 Byte):** Specifies the data type of the value, 0 for float, 1 for int, 2 for string, 3 for boolean, and -1 for None
 3. **Value Length (1 byte):** 
     * Specifies the length of the value in bytes if it was a successful PUT operations with a prior value or successful GET operation. 
@@ -39,6 +40,7 @@ class ProtocolOperationCode(IntEnum):
     PUT = 0
     GET = 1
     CONTAINS = 2
+    SHUTDOWN = 3  # Performs a graceful shutdown of the server
 
 
 class ProtocolDataType(IntEnum):
@@ -75,11 +77,15 @@ def _from_bytes_type(data: bytes, data_type: ProtocolDataType):
 
 
 def to_bytes(
-    operation_code: int, key, key_data_type: int, value=None, value_data_type: int = -1
+    operation_code: int,
+    key=0,
+    key_data_type: int = 0,
+    value=None,
+    value_data_type: int = -1,
 ):
     """
     Converts operation details into bytes following the updated protocol layout, including data types for key and value.
-    @param operation_code (int): holds the enum representation of the operation code: (0 for PUT, 1 for GET, or 2 CONTAINS).
+    @param operation_code (int): holds the enum representation of the operation code: (0 for PUT, 1 for GET, 2 CONTAINS, or 3 SHUTDOWN).
     @param key: The key to be used in the operation.
     @param key_data_type (int): The data type of the key represented as a single byte.
     @param value (optional): The value to be inserted. Relevant only for PUT operations. Defaults to None.
@@ -128,6 +134,9 @@ def from_bytes(data: bytes) -> tuple:
     """
     # Extract operation code
     operation_code = ProtocolDataType(int.from_bytes(data[0:1], byteorder="big"))
+
+    if operation_code == ProtocolOperationCode.SHUTDOWN:
+        return (operation_code, None, -1, None, -1)
 
     # Extract key length, key, and key data type
     key_data_type = ProtocolDataType(int.from_bytes(data[1:2], byteorder="big"))
@@ -178,7 +187,7 @@ def get_protocol_data_type(value):
     elif data_type == bool:
         return ProtocolDataType.BOOLEAN
     elif data_type == type(None):
-        return ProtocolDataType.NONE  #  None is only used in responses
+        return ProtocolDataType.NONE  #  None is only used in responses and shutdown
     else:
         raise ValueError("Unsupported data type")
 
@@ -298,6 +307,64 @@ def benchmark_minimal():
     server_socket.close()
 
 
+def handle_client_distributed(connection, shutdown=False):
+    """
+    Handles a single client connection for distributed server operations.
+    @param connection: The client connection object.
+    """
+    try:
+        while not shutdown:
+            request = read_distributed_request(connection)
+            if not request:
+                break  # Client closed connection
+
+            # Distrtibute the request to the appropriate servers
+
+            operation_code, response = process_distributed_request(request)
+            byte_response = generate_return_response(
+                operation_code, response, get_protocol_data_type(response)
+            )
+            if operation_code == ProtocolOperationCode.SHUTDOWN:
+                shutdown = True
+
+            try:
+                send_response(connection, byte_response)
+            except ConnectionResetError:
+                break  # Connection closed before sending response
+    except KeyboardInterrupt:  # Useful for exiting the server when testing locally
+        raise KeyboardInterrupt
+    except Exception as e:
+        print(f"Error handling client: {e}")
+    finally:
+        close_connection(connection)
+        return shutdown
+
+
+def hash_servers(server_addresses, key):
+    """
+    Hashes each server address using MurmurHash3 and returns the sorted list of hashed values.
+    @param server_addresses: A list of server addresses.
+    @param key: The key to be hashed.
+    @return: A sorted list of hashed server addresses.
+    """
+    return sorted(
+        [(server, hash(f"{key}{server}")) for server in server_addresses],
+        key=lambda x: x[1],
+    )
+
+
+def distribute_key_across_servers(server_addresses, key, replication_factor):
+    """
+    Distributes a key across multiple servers based on the replication factor.
+    @param server_addresses: A list of server addresses.
+    @param key: The key to be distributed.
+    @param replication_factor: The number of times the key should be replicated.
+    @return: A list of server addresses where the key should be stored.
+    """
+    hashed_servers = hash_servers(server_addresses, key)
+    return [server[0] for server in hashed_servers[:replication_factor]]
+
+
 # Function to initialize the server with multiplexing for the normal version
 def initialize_server_multiplexing(port: int):
     """
@@ -361,10 +428,36 @@ def read_request(client_socket) -> bytes:
         return None
 
 
+# Function to read request from client
+def read_distributed_request(client_socket) -> bytes:
+    """
+    Reads a request from the client socket and parses it according to the protocol.
+    @param client_socket: The client socket from which the request is read.
+    """
+    try:
+        # Assuming the first byte contains the operation code
+        header = client_socket.recv(1)
+        if not header:
+            return None  # No data received, client may have closed connection
+        # Further processing to parse the full request based on the protocol
+        # Reads the key data type (1 byte) and length (1 byte)
+        key_header = client_socket.recv(2)
+        key_length = int.from_bytes(key_header[1:2], byteorder="big")
+        # read in as many bytes as the key_length specifies
+        key_bytes = client_socket.recv(key_length) if key_length > 0 else b""
+        val_header = client_socket.recv(2)
+        val_length = int.from_bytes(val_header[1:2], byteorder="big")
+        val_bytes = client_socket.recv(val_length) if val_length > 0 else b""
+        return header + key_header + key_bytes + val_header + val_bytes
+    except Exception as e:
+        print(f"Error reading request: {e}")
+        return None
+
+
 # Function to process request
 def process_request(request, verbose=False):
     """
-    Processes the client request and performs the corresponding operation (PUT, GET, CONTAINS) on the BTree database.
+    Processes the client request and performs the corresponding operation (PUT, GET, CONTAINS, SHUTDOWN) on the BTree database.
     @param request: The parsed client request.
     """
     if verbose:
@@ -383,9 +476,44 @@ def process_request(request, verbose=False):
         )
     elif operation_code == ProtocolOperationCode.CONTAINS:
         return operation_code, BTREE.search(key) != None
+    elif operation_code == ProtocolOperationCode.SHUTDOWN:
+        # Perform any necessary cleanup before shutting down the server
+        # TODO: Add cleanup code here
+        return operation_code, "Shutdown confirmed"
     else:
         raise NotImplementedError(
-            "Only the PUT (0) GET (1) and CONTAINS (2) operations are supported by the protocol"
+            "Only the PUT (0) GET (1) CONTAINS (2) and SHUTDOWN (3) operations are supported by the protocol"
+        )
+
+
+def process_distributed_request(request, verbose=False):
+    """
+    Processes the client request and performs the corresponding operation (PUT, GET, CONTAINS, SHUTDOWN) on the BTree database.
+    @param request: The parsed client request.
+    """
+    if verbose:
+        print(f"Processing request: {request}")
+    operation_code, key, key_data_type, value, value_data_type = from_bytes(request)
+
+    if operation_code == ProtocolOperationCode.PUT:
+        return operation_code, BTREE.insert(key, value)
+    elif operation_code == ProtocolOperationCode.GET:
+        search_result = BTREE.search(key)
+        # Return the operation code and the value associated with the key
+        return operation_code, (
+            search_result[0].values[search_result[1]]
+            if search_result is not None
+            else None
+        )
+    elif operation_code == ProtocolOperationCode.CONTAINS:
+        return operation_code, BTREE.search(key) != None
+    elif operation_code == ProtocolOperationCode.SHUTDOWN:
+        # Perform any necessary cleanup before shutting down the server
+        # TODO: Add cleanup code here
+        return operation_code, "Shutdown confirmed"
+    else:
+        raise NotImplementedError(
+            "Only the PUT (0) GET (1) CONTAINS (2) and SHUTDOWN (3) operations are supported by the protocol"
         )
 
 
@@ -535,6 +663,19 @@ def server_main_minimal():
         handle_client_minimal(connection)
 
 
+def server_main_distributed(address="127.0.0.1", port=12345):
+    # Populate data for reads
+    fill_DB(0, 1_000_000)
+    server_socket = initialize_server(address=address, port=port)
+    print("Server initialized. Waiting for connections...")
+
+    shutdown = False
+    while not shutdown:
+        connection, address = server_socket.accept()
+        print(f"Connection from {address}")
+        shutdown = handle_client_distributed(connection, shutdown=shutdown)
+
+
 def client_main_minimal(plot_results=False, num_trials=1):
     address = "127.0.0.1"
     port = 12345
@@ -556,7 +697,9 @@ def client_main_minimal(plot_results=False, num_trials=1):
             for _ in range(read_ops):
                 key = str(random.randint(0, 1000000))
                 # Create read request
-                req_bytes = to_bytes(ProtocolOperationCode.GET, key, ProtocolDataType.INT)
+                req_bytes = to_bytes(
+                    ProtocolOperationCode.GET, key, ProtocolDataType.INT
+                )
                 client_socket.send(req_bytes)
                 response_bytes = read_response(client_socket)
                 operation_code, val_type, value = process_response(response_bytes)
@@ -564,7 +707,9 @@ def client_main_minimal(plot_results=False, num_trials=1):
 
             end_time = time.time()
             time_taken = end_time - start_time
-            print(f"Time for trial {trial+1}/{num_trials} with {read_ops} read operations: {time_taken} seconds")
+            print(
+                f"Time for trial {trial+1}/{num_trials} with {read_ops} read operations: {time_taken} seconds"
+            )
             client_socket.close()
 
             if plot_results:
@@ -586,6 +731,219 @@ def client_main_minimal(plot_results=False, num_trials=1):
         plt.savefig("benchmark_results_minimal.png")
 
 
+def client_main_distributed_RW(
+    replication_factor, server_addresses, plot_results=False, num_trials=1
+):
+    """
+    Used to determine the time required to complete a series of read and write operations with random keys.
+    This function only supports the PUT and GET operations since the CONTAINS operation is not relevant for this benchmark.
+    the underlying code for contains is used in the GET operation to determine if the key exists.
+    This only focuses on a single client with mutliple server connections at the specified replication factor.
+    @param replication_factor: The number of times each key should be replicated.
+    @param server_addresses: A list of server addresses.
+    @param plot_results: Whether to plot the benchmark results.
+    @param num_trials: The number of trials to run for each number of operations.
+    """
+    if plot_results:
+        op_read_times = []
+
+    # Values from 10 to 100,000 increasing by a factor of 10 each time
+    num_read_operations = [10**i for i in range(1, 6)]
+
+    for read_ops in num_read_operations:
+        trial_op_read_times = []
+        for trial in range(num_trials):
+            # Create a new client
+            connections = {}
+            for server_and_port in server_addresses:
+                server, port = server_and_port.split(":")
+                connections[server_and_port] = socket.socket()
+                connections[server_and_port].connect((server, int(port)))
+
+            start_time = time.time()
+
+            for _ in range(read_ops):
+                key_int = random.randint(0, 1_000_000)
+                key = str(key_int)
+                key_servers = distribute_key_across_servers(
+                    key=key,
+                    replication_factor=replication_factor,
+                    server_addresses=server_addresses,
+                )
+                # Performa a PUT operation 50% of the time to balance out Reads and Writes
+                if random.random() < 0.5:
+                    value = key_int * 3
+                    # Create put request
+                    req_bytes = to_bytes(
+                        ProtocolOperationCode.PUT,
+                        key,
+                        ProtocolDataType.INT,
+                        value,
+                        ProtocolDataType.INT,
+                    )
+                    # PUT the value to all servers
+                    for server in key_servers:
+                        connections[server].send(req_bytes)
+                        response_bytes = read_response(connections[server])
+                        operation_code, val_type, value = process_response(
+                            response_bytes
+                        )
+                        # value now holds the response value from the DB (responses from each server should be the same)
+                else:
+                    # Create read request
+                    req_bytes = to_bytes(
+                        ProtocolOperationCode.GET, key, ProtocolDataType.INT
+                    )
+                    # Read the value from a random one of the servers
+                    server_to_get = random.choice(key_servers)
+                    connections[server_to_get].send(req_bytes)
+                    response_bytes = read_response(connections[server_to_get])
+                    operation_code, val_type, value = process_response(response_bytes)
+                    # value now holds the response value from the DB
+
+            end_time = time.time()
+            time_taken = end_time - start_time
+            print(
+                f"Time for trial {trial+1}/{num_trials} with {read_ops} Read/Write operations: {time_taken} seconds"
+            )
+            for connection in connections.values():
+                connection.close()
+
+            if plot_results:
+                trial_op_read_times.append(time_taken)
+        if plot_results:
+            op_read_times.append(sum(trial_op_read_times) / num_trials)
+
+    if plot_results:
+        num_servers = len(server_addresses)
+        plt.figure(figsize=(10, 6))
+        plt.plot(num_read_operations, op_read_times, marker="o", linestyle="-")
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel("Read/Write Operations")
+        plt.ylabel("Run Times [s]")
+        plt.title(
+            f"Single Client Run Times vs Reads & Writes Across {num_servers} Servers: Replicated {replication_factor} Times"
+        )
+        plt.grid(True, which="both", ls="--")
+
+        # Save the figure as a PNG file
+        plt.savefig(
+            f"benchmark_results_distributed_RW_{replication_factor}_{num_servers}.png"
+        )
+
+
+def client_main_distributed_R(
+    replication_factor, server_addresses, plot_results=False, num_trials=1
+):
+    """
+    Read only version of the distributed client to test the server implementation.
+    @param replication_factor: The number of times each key should be replicated.
+    @param server_addresses: A list of server addresses.
+    """
+    print("Initializing distributed client for reads...")
+    print(f"Replication factor: {replication_factor}")
+    print(f"Server addresses: {server_addresses}")
+    num_servers = len(server_addresses)
+
+    if plot_results:
+        op_read_times = []
+
+    # Values from 10 to 100,000 increasing by a factor of 10 each time
+    num_read_operations = [10**i for i in range(1, 6)]
+
+    for read_ops in num_read_operations:
+        trial_op_read_times = []
+        for trial in range(num_trials):
+            # Create a new client
+            connections = {}
+            try:
+                for server_and_port in server_addresses:
+                    server, port = server_and_port.split(":")
+                    connections[server_and_port] = socket.socket()
+                    connections[server_and_port].connect((server, int(port)))
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, ConnectionRefusedError) as e:
+                print(f"Server {server_and_port} is not responding. Removing from server list.")
+                time.sleep(0.1)  # Wait for connections to close
+                server_addresses.remove(server_and_port)
+                continue
+
+
+            start_time = time.time()
+
+            for i in range(read_ops):
+                # if i % 125 == 0: # Left in for testing purposes
+                #     # Close the connections every 125 operations to simulate a new client
+                #     for connection in connections.values():
+                #         connection.close()
+                #     time.sleep(0.1)  # Wait for connections to close
+                #     try:
+                #         for server_and_port in server_addresses:
+                #             server, port = server_and_port.split(":")
+                #             connections[server_and_port] = socket.socket()
+                #             connections[server_and_port].connect((server, int(port)))
+                #     except (BrokenPipeError, ConnectionResetError, TimeoutError, ConnectionRefusedError) as e:
+                #         print(f"Server {server_and_port} is not responding. Removing from server list.")
+                #         time.sleep(0.1)  # Wait for connections to close
+                #         server_addresses.remove(server_and_port)
+                #         continue
+
+                key_int = random.randint(0, 1_000_000)
+                key = str(key_int)
+                key_servers = distribute_key_across_servers(
+                    key=key,
+                    replication_factor=replication_factor,
+                    server_addresses=server_addresses,
+                )
+
+                # Create read request
+                req_bytes = to_bytes(
+                    ProtocolOperationCode.GET, key, ProtocolDataType.INT
+                )
+                # Read the value from a random one of the servers
+                server_to_get = random.choice(key_servers)
+                try:
+                    connections[server_to_get].send(req_bytes)
+                    response_bytes = read_response(connections[server_to_get])
+                    operation_code, val_type, value = process_response(response_bytes)
+                    # value now holds the response value from the DB
+                except (BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+                    print(f"Server {server_to_get} is not responding. Removing from server list.")
+                    time.sleep(0.1)  # Wait for connections to close
+                    server_addresses.remove(server_to_get)
+                    continue
+
+            end_time = time.time()
+            time_taken = end_time - start_time
+            print(
+                f"Time for trial {trial+1}/{num_trials} with {read_ops} Read/Write operations: {time_taken} seconds"
+            )
+            for connection in connections.values():
+                connection.close()
+
+            if plot_results:
+                trial_op_read_times.append(time_taken)
+        if plot_results:
+            op_read_times.append(sum(trial_op_read_times) / num_trials)
+
+    if plot_results:
+        plt.figure(figsize=(10, 6))
+        plt.plot(num_read_operations, op_read_times, marker="o", linestyle="-")
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel("Read Operations")
+        plt.ylabel("Run Times [s]")
+        plt.title(
+            f"Multiple Client Run Times vs Reads Across {num_servers} Servers: Replicated {replication_factor} Times"
+        )
+        plt.grid(True, which="both", ls="--")
+
+        # Save the figure as a PNG file
+        plt.savefig(
+            f"benchmark_results_distributed_R_{replication_factor}_{num_servers}_{time.monotonic_ns()}.png"
+        )
+
+
 # Example usage
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -597,7 +955,30 @@ if __name__ == "__main__":
     if mode == "server":
         server_main_minimal()  # Run this on the server terminal
     elif mode == "client":
-        client_main_minimal(plot_results=True, num_trials=3)  # Run this on the client terminal
+        client_main_minimal(
+            plot_results=True, num_trials=3
+        )  # Run this on the client terminal
+    elif mode == "dist_client_rw":
+        # Parse out the replication factor and addresses
+        replication_factor = int(sys.argv[2])
+        server_addresses = sys.argv[3:]
+        client_main_distributed_RW(
+            replication_factor, server_addresses, plot_results=True, num_trials=3
+        )
+    elif mode == "dist_client_r":
+        # Parse out the replication factor and addresses
+        replication_factor = int(sys.argv[2])
+        server_addresses = sys.argv[3:]
+        client_main_distributed_R(
+            replication_factor, server_addresses, plot_results=True, num_trials=5
+        )
+
+    elif mode == "dist_server":
+        # Parse out the replication factor and addresses
+        address = sys.argv[2]
+        port = int(sys.argv[3])
+        server_main_distributed(address, port)
+
     else:
         print("Invalid mode. Please choose 'server' or 'client'.")
         sys.exit(1)
